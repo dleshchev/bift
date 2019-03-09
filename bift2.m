@@ -1,4 +1,4 @@
-function [rgrid, P, Perr, Ifit, Rg, I0 ] = bift( q, I, I_err, varargin )
+function [rgrid, P, Perr, Ifit, Rg, I0 ] = bift2( q, I, I_err, varargin )
 %BIFT Calculates the inverse Fourier Transform using Bayes inference (v0.0)
 %   This function utilizes method outlined in S. Hansen, J. Appl. Cryst.
 %   (2000) 33, 1415-1421. The probaility notation is taken from A.H. Larsen
@@ -108,7 +108,7 @@ if numvarargs > 4
 end
 
 % default values
-optargs = {52, true, [0, 10, 2, 500, 31], 3};
+optargs = {52, true, [0, 10, 0, 10, 2, 500, 31], 3};
 
 % update default vaues if they are provided
 for i = 1:numvarargs
@@ -116,6 +116,7 @@ for i = 1:numvarargs
         optargs{i} = varargin{i};
     end
 end
+[Nr, plotting, initGrid, postDensity] = optargs{:};
 
 %% Data prep
 % Reshape the data
@@ -132,78 +133,95 @@ I_err = I_err/normFactor;
 % Initial grid parameters
 logLambdaMin = initGrid(1);
 logLambdaMax = initGrid(2);
-DmaxMin = initGrid(3);
-DmaxMax = initGrid(4);
-npt_coarse = initGrid(5);
+logAlphaMin = initGrid(3);
+logAlphaMax = initGrid(4);
+DmaxMin = initGrid(5);
+DmaxMax = initGrid(6);
+npt_coarse = initGrid(7);
 
 %% Search for a good initial start
 lambda_init = 10.^linspace(logLambdaMin, logLambdaMax, npt_coarse)';
+alpha_init = 10.^linspace(logAlphaMin, logAlphaMax, npt_coarse)';
 Dmax_init = linspace(DmaxMin, DmaxMax, npt_coarse)';
 
-doubleNegLogPosterior_init = zeros(length(lambda_init), length(Dmax_init));
+doubleNegLogPosterior_init = zeros(length(lambda_init), length(alpha_init), length(Dmax_init));
 for i = 1:length(lambda_init)
     for j = 1:length(Dmax_init)
-        doubleNegLogPosterior_init(i, j) = getSolution(I, I_err, lambda_init(i), Dmax_init(j));
+        for k = 1:length(Dmax_init)
+            disp([i, j, k])
+            doubleNegLogPosterior_init(i, j, k) = getSolution(I, I_err, lambda_init(i), alpha_init(j), Dmax_init(k));
+        end
     end
 end
 
 [~, idx] = min(doubleNegLogPosterior_init(:));
-[idx_row, idx_col] = ind2sub(size(doubleNegLogPosterior_init), idx);
-par_start = [log(lambda_init(idx_row)), Dmax_init(idx_col)];
+[idx_row, idx_col, idx_dep] = ind2sub(size(doubleNegLogPosterior_init), idx);
+par_start = [log(lambda_init(idx_row)), log(alpha_init(idx_col)), Dmax_init(idx_dep)];
 
 %% Search for the optimum
-doubleNegLogPosterior_fun = @(a) getSolution(I, I_err, exp(a(1)), a(2));
-options = optimoptions(@fminunc, 'Algorithm', 'quasi-newton', 'Display', 'Off');
+doubleNegLogPosterior_fun = @(a) getSolution(I, I_err, exp(a(1)), exp(a(2)), a(3));
+options = optimoptions(@fminunc, 'Algorithm', 'quasi-newton', 'Display', 'iter');
 [par_opt, doubleNegLogPosterior_opt, ~, ~, ~, Hess] = fminunc(doubleNegLogPosterior_fun, par_start, options);
 
 logLambda_opt = par_opt(1);
-Dmax_opt = par_opt(2);
+logAlpha_opt = par_opt(2);
+Dmax_opt = par_opt(3);
 
 par_std = sqrt(diag(pinv(Hess)));
 logLambda_std = par_std(1);
-Dmax_std = par_std(2);
+logAlpha_std = par_std(2);
+Dmax_std = par_std(3);
 
 %% Final grid calculation
-% To define the final grid we need to find the meaningful range where
-% posterior will be more than 0. To do so, we will find the ranges where
-% doubleNegLogPosterior increases by 25, which resembles 5-sigma rule.
-[lambda_grid, Dmax_grid] = getFinalGrid(25, postDensity);
+% To define the final grid we need to find the meaningful range in (lambda,
+% Dmax) plane where posterior will be more than 0. To do so, we will find
+% the ranges where doubleNegLogPosterior increases by 25, which resembles
+% 5-sigma rule.
+[lambda_grid, alpha_grid, Dmax_grid] = getFinalGrid(25, postDensity);
 
+% final rgrid is defined using Dmax_opt and extended up to Dmax_grid with
+% appropriate step size:
 rgrid = getRgrid(Dmax_opt);
 rgrid = [ rgrid(1:end-1); ...
          (rgrid(end) : (rgrid(2)-rgrid(1)) : max(Dmax_grid))'];
 
+% value initialization for the final posterior probability calculation:
 P = zeros(size(rgrid));
 Perr = zeros(size(rgrid));
 Nind = 0;
 
-doubleNegLogPosterior_grid = zeros(length(lambda_grid), length(Dmax_grid));
-posterior = zeros(length(lambda_grid), length(Dmax_grid));
+doubleNegLogPosterior_grid = zeros(length(lambda_grid), length(alpha_grid), length(Dmax_grid));
+posterior = zeros(length(lambda_grid), length(alpha_grid), length(Dmax_grid));
 
-% commented parts of the loop below are for lazy integration. Its usage is
-% descouraged
-for j = 2:length(Dmax_grid)-1
-    for i = 2:length(lambda_grid)-1
-        dlambda = (lambda_grid(i+1) - lambda_grid(i-1))/2;
-        dDmax = (Dmax_grid(j+1) -  Dmax_grid(j-1))/2;
-% for j = 1:length(Dmax_grid)
-%     for i = 1:length(lambda_grid)
-        [doubleNegLogPosterior_grid(i, j), r_loc, P_loc, Nind_loc] = ...
-            getSolution(I, I_err, lambda_grid(i), Dmax_grid(j));
-        posterior(i, j) = exp(-0.5*(doubleNegLogPosterior_grid(i, j) - doubleNegLogPosterior_opt))*dlambda*dDmax;
-%         posterior(i, j) = exp(-0.5*(doubleNegLogPosterior_grid(i, j) - doubleNegLogPosterior_opt));
-        P_loc_interp = interp1(r_loc, P_loc, rgrid, 'pchip', 0);
-        P = P + posterior(i, j)*P_loc_interp;
-        Perr = Perr + posterior(i, j)*P_loc_interp.^2;
-        Nind = Nind + posterior(i, j)*Nind_loc;
+
+% for k = 1:length(Dmax_grid)
+%     for j = 1:length(alpha_grid)
+%         for i = 1:length(lambda_grid)
+for k = 2:length(Dmax_grid)-1
+    for j = 2:length(alpha_grid)-1
+        for i = 2:length(lambda_grid)-1
+            disp([i,j,k])
+            dlambda = (lambda_grid(i+1) - lambda_grid(i-1))/2;
+            dalpha = (alpha_grid(i+1) - alpha_grid(i-1))/2;
+            dDmax = (Dmax_grid(j+1) -  Dmax_grid(j-1))/2;
+            [doubleNegLogPosterior_grid(i, j, k), r_loc, P_loc, Nind_loc] = ...
+                getSolution(I, I_err, lambda_grid(i), alpha_grid(j), Dmax_grid(k));
+            posterior(i, j, k) = exp(-0.5*(doubleNegLogPosterior_grid(i, j, k) - doubleNegLogPosterior_opt))*dlambda*dalpha*dDmax;
+%             posterior(i, j, k) = exp(-0.5*(doubleNegLogPosterior_grid(i, j, k) - doubleNegLogPosterior_opt));
+            P_loc_interp = interp1(r_loc, P_loc, rgrid, 'pchip', 0);
+            P = P + posterior(i, j, k)*P_loc_interp;
+            Perr = Perr + posterior(i, j, k)*P_loc_interp.^2;
+            Nind = Nind + posterior(i, j, k)*Nind_loc;
+        end
     end
 end
 
-%%
+%% Renormalization and output calculation
 normScale = sum(posterior(:));
 posterior = posterior/normScale;
-P = P/normScale*normFactor;
+P = P/normScale;
 Perr = sqrt(Perr/normScale - P.^2)*normFactor;
+P = P*normFactor;
 Nind = Nind/normScale;
 Tfinal = getTmatrix(rgrid);
 Ifit = Tfinal*P;
@@ -219,22 +237,40 @@ I0 = 4*pi*trapz(rgrid, P);
 if plotting
     figure();
     clf();
-    subplot(221)
-    mesh(Dmax_grid, lambda_grid, posterior);
+    subplot(231)
+    mesh(Dmax_grid, lambda_grid, squeeze(sum(posterior, 2)));
     hold on
     set(gca,'yscale','log')
     xlabel(['Dmax, ', char(197)])
     ylabel('\lambda')
     zlabel('Posterior Probability')
+    
+    subplot(232)
+    mesh(Dmax_grid, alpha_grid, squeeze(sum(posterior, 1)));
+    hold on
+    set(gca,'yscale','log')
+    xlabel(['Dmax, ', char(197)])
+    ylabel('\alpha')
+    zlabel('Posterior Probability')
+    
+    subplot(233)
+    mesh(lambda_grid, alpha_grid, squeeze(sum(posterior, 3)));
+    hold on
+    set(gca,'yscale','log')
+    set(gca,'xscale','log')
+    xlabel('\lambda')
+    ylabel('\alpha')
+    zlabel('Posterior Probability')
 
-    subplot(222); hold on;
-    errorbar(rgrid, P, Perr, 'k.-')
+    subplot(223); hold on;
+    errorbar(rgrid, P./rgrid, Perr./rgrid, 'k.-')
+    xlim([0.01, 20])
     xlabel(['r, ', char(197)])
     ylabel('P(r)')
     legend(sprintf( ['Rg = ', num2str(round(Rg, 2)), '\n', ...
                      'I0 = ', num2str(round(I0, 3))]))
     
-    subplot(223); hold on;
+    subplot(224); hold on;
     plot(q, I, 'k.-')
     plot(q, Ifit, 'r-')
     legend('data', sprintf( ...
@@ -248,10 +284,11 @@ if plotting
 end
 
 %% AUX functions
-function [r, T, L] = getMatrices(DmaxVal)
+function [r, T, L, K] = getMatrices(DmaxVal)
     r = getRgrid(DmaxVal);
     T = getTmatrix(r);
     L = getLmatrix();
+    K = getKmatrix();
 end
 
 
@@ -277,17 +314,21 @@ function L = getLmatrix()
     L(end, end) = 1/sqrt(2);
 end
 
+function K = getKmatrix()
+    K = eye(Nr);
+end
 
-function [doubleNegLogPosterior, r, P, Nind] = getSolution(I, I_err, lambdaVal, DmaxVal)
-    [r, T, L] = getMatrices(DmaxVal);
+
+function [doubleNegLogPosterior, r, P, Nind] = getSolution(I, I_err, lambdaVal, alphaVal, DmaxVal)
+    [r, T, L, K] = getMatrices(DmaxVal);
     W = diag(1./I_err.^2);
-    A = lambdaVal*(L'*L);
+    A = lambdaVal*(L'*L) + alphaVal*(K'*K);
     B = T'*W*T;
     C = A + B;
     d = T'*W*I;
     P = pinv(C)*d;
     chisq = norm((T*P - I)./I_err)^2;
-    penalty = lambdaVal*norm(L*P)^2;
+    penalty = lambdaVal*norm(L*P)^2 + alphaVal*norm(K*P)^2;
     Aeig = eig(A);
     Beig = real(eig(B));
     Ceig = eig(C);
@@ -295,20 +336,32 @@ function [doubleNegLogPosterior, r, P, Nind] = getSolution(I, I_err, lambdaVal, 
     logdetA = sum(log(Aeig));
     logdetC = sum(log(Ceig));
     logG = logdetC - logdetA;
-    doubleNegLogPosterior = chisq + penalty + logG + 2*log(lambdaVal);
+    doubleNegLogPosterior = chisq + penalty + logG + 2*log(lambdaVal) + 2*log(alphaVal);
 %     doubleNegLogPosterior = chisq + penalty + logG;
 end
 
 
-function [lambda_grid, Dmax_grid] = getFinalGrid(dValThresh, pointDensity)
+function [lambda_grid, alpha_grid, Dmax_grid] = getFinalGrid(dValThresh, pointDensity)
     nLambdaPos = searchLambda(dValThresh, +1);
     nLambdaNeg = searchLambda(dValThresh, -1);
+    nAlphaPos = searchAlpha(dValThresh, +1);
+    nAlphaNeg = searchAlpha(dValThresh, -1);
     nDmaxPos = searchDmax(dValThresh, +1);
     nDmaxNeg = searchDmax(dValThresh, -1);
     
-    lambda_grid = linspace(nLambdaNeg, nLambdaPos, (-nLambdaNeg + nLambdaPos)*pointDensity + 1);
+    nLambda = max([-nLambdaNeg, nLambdaPos]);
+    nAlpha = max([-nAlphaNeg, nAlphaPos]);
+    nDmax = max([-nDmaxNeg, nDmaxPos]);
+    
+    disp([-nLambdaNeg, nLambdaPos, nLambda])
+    disp([-nAlphaNeg, nAlphaPos, nAlpha])
+    disp([-nDmaxNeg, nDmaxPos, nDmax])
+    
+    lambda_grid = linspace(-nLambda, nLambda, pointDensity);
     lambda_grid = exp(logLambda_opt + lambda_grid' * logLambda_std);
-    Dmax_grid = linspace(nDmaxNeg, nDmaxPos, (-nDmaxNeg + nDmaxPos)*pointDensity + 1);
+    alpha_grid = linspace(-nAlpha, nAlpha, pointDensity);
+    alpha_grid = exp(logAlpha_opt + alpha_grid' * logAlpha_std);
+    Dmax_grid = linspace(-nDmax, nDmax, pointDensity);
     Dmax_grid = Dmax_opt + Dmax_grid' * Dmax_std;
 end
 
@@ -319,7 +372,19 @@ function n = searchLambda(dValThresh, direction)
     while dVal < dValThresh
         n = n + direction;
         dVal = doubleNegLogPosterior_fun( ...
-            [logLambda_opt + n * logLambda_std, Dmax_opt] ...
+            [logLambda_opt + n * logLambda_std, logAlpha_opt, Dmax_opt] ...
+                                          ) - doubleNegLogPosterior_opt;
+    end
+end
+
+
+function n = searchAlpha(dValThresh, direction)
+    dVal = 0;
+    n = 0;
+    while dVal < dValThresh
+        n = n + direction;
+        dVal = doubleNegLogPosterior_fun( ...
+            [logLambda_opt, logAlpha_opt + n * logAlpha_std, Dmax_opt] ...
                                           ) - doubleNegLogPosterior_opt;
     end
 end
@@ -331,7 +396,7 @@ function n = searchDmax(dValThresh, direction)
     while dVal < dValThresh
         n = n + direction;
         dVal = doubleNegLogPosterior_fun( ...
-            [logLambda_opt, Dmax_opt + n * Dmax_std] ...
+            [logLambda_opt, logAlpha_opt, Dmax_opt + n * Dmax_std] ...
                                           ) - doubleNegLogPosterior_opt;
     end
 end
